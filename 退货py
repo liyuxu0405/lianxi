@@ -1,0 +1,377 @@
+import streamlit as st
+import pandas as pd
+import io
+import os
+import glob
+import zipfile
+import time
+import csv
+from datetime import datetime, timedelta, date
+
+# ================= 配置区域 =================
+DATA_DIR = "uploaded_data"
+LOG_FILE = "operation_logs.csv"
+
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR)
+
+USERS = st.secrets["passwords"]
+RETENTION_DAYS = 7  # 文件保留7天
+
+# ================= 页面配置 =================
+st.set_page_config(
+    page_title="电商协作系统·企业版",
+    page_icon="🚀",
+    layout="wide"
+)
+
+
+# ================= 日志与清理 =================
+def log_action(user, action, detail=""):
+    try:
+        file_exists = os.path.isfile(LOG_FILE)
+        now_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(LOG_FILE, mode='a', newline='', encoding='utf-8-sig') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["时间", "用户", "操作类型", "详细信息"])
+            writer.writerow([now_time, user, action, detail])
+    except:
+        pass
+
+
+def auto_cleanup_old_files():
+    try:
+        now = time.time()
+        retention_seconds = RETENTION_DAYS * 24 * 3600
+        files = glob.glob(os.path.join(DATA_DIR, "*.xlsx"))
+        for f in files:
+            try:
+                # 检查文件修改时间
+                if now - os.path.getmtime(f) > retention_seconds:
+                    os.remove(f)
+            except:
+                pass
+    except:
+        pass
+
+
+# ================= 工具函数 =================
+def smart_read(uploaded_file, dtype_str=False):
+    try:
+        file_ext = uploaded_file.name.split('.')[-1].lower()
+        if file_ext in ['xls', 'xlsx']:
+            return pd.read_excel(uploaded_file, dtype=str if dtype_str else None)
+        else:
+            bytes_data = uploaded_file.getvalue()
+            for enc in ['utf-8', 'gbk', 'gb18030']:
+                try:
+                    return pd.read_csv(io.BytesIO(bytes_data), encoding=enc, dtype=str)
+                except:
+                    continue
+            return None
+    except Exception as e:
+        st.error(f"❌ 读取失败: {e}")
+        return None
+
+
+def to_excel_bytes(df):
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Sheet1')
+        workbook = writer.book
+        worksheet = writer.sheets['Sheet1']
+        format1 = workbook.add_format({'num_format': '@'})
+        for i, col in enumerate(df.columns):
+            worksheet.set_column(i, i, 20, format1)
+    return output.getvalue()
+
+
+def distribute_codes(group):
+    if '商家备注' not in group.columns:
+        return group
+    rows_count = len(group)
+    first_remark = str(group.iloc[0]['商家备注'])
+    temp_str = first_remark.replace('\n', '|')
+    codes_list = [c.strip() for c in temp_str.split('|') if c.strip()]
+    if rows_count > 1 and len(codes_list) == rows_count:
+        group['商家备注'] = codes_list
+        return group
+    if rows_count == 1 and len(codes_list) > 1:
+        if len(set(codes_list)) == 1:
+            group['商家备注'] = codes_list[0]
+            return group
+    unique_codes = sorted(list(set(codes_list)), key=codes_list.index)
+    if rows_count > 1 and len(unique_codes) == rows_count:
+        group['商家备注'] = unique_codes
+        return group
+    group['商家备注'] = group['商家备注'].astype(str).str.replace('|', '', regex=False).str.strip()
+    return group
+
+
+# ================= 登录逻辑 =================
+def check_password():
+    def password_entered():
+        if st.session_state["username"] in USERS and st.session_state["password"] == USERS[
+            st.session_state["username"]]:
+            st.session_state["password_correct"] = True
+            st.session_state["current_user"] = st.session_state["username"]
+            log_action(st.session_state["username"], "登录系统", "登录成功")
+            del st.session_state["password"]
+        else:
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        st.markdown("## 🔒 企业协作系统登录")
+        st.text_input("账号", key="username")
+        st.text_input("密码", type="password", key="password")
+        st.button("登录", on_click=password_entered)
+        return False
+    elif not st.session_state["password_correct"]:
+        st.markdown("## 🔒 企业协作系统登录")
+        st.text_input("账号", key="username")
+        st.text_input("密码", type="password", key="password")
+        st.button("登录", on_click=password_entered)
+        st.error("❌ 账号或密码错误")
+        return False
+    else:
+        return True
+
+
+# ================= 主程序 =================
+if check_password():
+    auto_cleanup_old_files()
+    current_user = st.session_state["current_user"]
+
+    with st.sidebar:
+        st.write(f"👤 用户: **{current_user}**")
+        is_warehouse = current_user in ["cangku", "admin"]
+        is_developer = current_user in ["kaifa", "admin"]
+
+        menu_options = ["任务一：24小时超时筛选", "任务二：仓库表格清洗 (自动提交)"]
+        if is_warehouse:
+            menu_options.insert(0, "🏭 仓库总控台 (下载汇总)")
+        if is_developer:
+            menu_options.append("👨‍💻 开发者后台 (操作日志)")
+
+        task = st.radio("👉 菜单导航", menu_options)
+
+        st.markdown("---")
+        if is_warehouse and task == "🏭 仓库总控台 (下载汇总)":
+            if st.button("🗑️ 清空所有数据", type="primary"):
+                files = glob.glob(os.path.join(DATA_DIR, "*.xlsx"))
+                for f in files:
+                    os.remove(f)
+                log_action(current_user, "清空数据")
+                st.success("已清空！")
+                time.sleep(1)
+                st.rerun()
+
+        if st.button("退出登录"):
+            log_action(current_user, "退出系统")
+            del st.session_state["password_correct"]
+            del st.session_state["current_user"]
+            st.rerun()
+
+    # --- 开发者后台 ---
+    if task == "👨‍💻 开发者后台 (操作日志)":
+        st.title("👨‍💻 系统操作日志")
+        if os.path.exists(LOG_FILE):
+            log_df = pd.read_csv(LOG_FILE)
+            st.dataframe(log_df.iloc[::-1], use_container_width=True)
+            st.download_button("📥 下载日志", open(LOG_FILE, "rb").read(), "logs.csv", "text/csv")
+        else:
+            st.info("暂无日志。")
+
+    # --- 仓库总控台 (已升级日期筛选) ---
+    elif task == "🏭 仓库总控台 (下载汇总)":
+        st.title("🏭 仓库总数据汇总")
+
+        # === 🔥 1. 增加日期筛选组件 ===
+        st.markdown("### 📅 数据筛选")
+        col_date, col_info = st.columns([1, 2])
+        with col_date:
+            # 默认选今天
+            today = datetime.now().date()
+            # 允许选择时间段
+            selected_date = st.date_input(
+                "请选择要汇总的日期 (支持跨天)",
+                value=(today, today),  # 默认今天到今天
+                help="如果是补周六周日的数据，请把范围选宽一点"
+            )
+
+        # 处理日期范围逻辑
+        if isinstance(selected_date, tuple):
+            if len(selected_date) == 2:
+                start_date, end_date = selected_date
+            elif len(selected_date) == 1:
+                start_date = end_date = selected_date[0]
+            else:
+                start_date = end_date = today
+        else:
+            start_date = end_date = selected_date
+
+        # === 2. 筛选符合日期的文件 ===
+        all_files = glob.glob(os.path.join(DATA_DIR, "*.xlsx"))
+        target_files = []
+
+        for f in all_files:
+            try:
+                # 获取文件修改时间戳
+                mtime = os.path.getmtime(f)
+                file_date = datetime.fromtimestamp(mtime).date()
+                # 判断是否在选中范围内
+                if start_date <= file_date <= end_date:
+                    target_files.append(f)
+            except:
+                pass
+
+        # === 3. 显示结果 ===
+        if not target_files:
+            if not all_files:
+                st.warning("📭 系统里没有任何数据。")
+            else:
+                st.warning(f"🔍 在 {start_date} 到 {end_date} 期间，没有找到提交记录。")
+                st.info("提示：请检查日期是否选对，或者员工是否是在这几天提交的。")
+        else:
+            with col_info:
+                st.success(f"✅ 在所选日期范围内，找到 **{len(target_files)}** 份表格。")
+
+            df_list = []
+            for f in target_files:
+                try:
+                    temp_df = pd.read_excel(f, dtype=str)
+
+                    filename = os.path.basename(f)
+                    if "[" in filename and "]" in filename:
+                        submitter = filename.split("]")[0].replace("[", "")
+                    else:
+                        submitter = "未知"
+
+                    temp_df.insert(0, "_sys_提交人", submitter)
+                    temp_df.insert(1, "_sys_来源文件", filename)
+                    df_list.append(temp_df)
+                except:
+                    pass
+
+            if df_list:
+                total_df = pd.concat(df_list, ignore_index=True)
+                raw_count = len(total_df)
+
+                # 去重逻辑
+                business_cols = [c for c in total_df.columns if not c.startswith("_sys_")]
+                total_df = total_df.drop_duplicates(subset=business_cols, keep='first')
+                final_count = len(total_df)
+
+                # 预览
+                display_df = total_df.rename(columns={"_sys_提交人": "提交人", "_sys_来源文件": "来源文件"})
+                st.dataframe(display_df)
+
+                st.markdown("### 📥 下载区域：")
+                col1, col2 = st.columns(2)
+
+                # 文件名带上日期范围，方便归档
+                date_range_str = f"{start_date.strftime('%Y%m%d')}"
+                if start_date != end_date:
+                    date_range_str += f"-{end_date.strftime('%Y%m%d')}"
+
+                with col1:
+                    clean_cols = [c for c in total_df.columns if not c.startswith("_sys_")]
+                    clean_df = total_df[clean_cols]
+                    st.download_button(
+                        label="🚀 下载纯净版 (导入系统专用)",
+                        data=to_excel_bytes(clean_df),
+                        file_name=f"系统导入_{date_range_str}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        type="primary",
+                        help="不含提交人，已去重"
+                    )
+
+                with col2:
+                    st.download_button(
+                        label="📄 下载核对版 (含提交人)",
+                        data=to_excel_bytes(display_df),
+                        file_name=f"管理员核对_{date_range_str}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        help="含提交人信息"
+                    )
+
+    # --- 任务一 ---
+    elif task == "任务一：24小时超时筛选":
+        st.header("⏳ 任务一：超时订单筛选")
+        uploaded_files = st.file_uploader("上传文件", type=['xls', 'xlsx', 'csv'], accept_multiple_files=True, key="t1")
+        if uploaded_files and st.button("开始筛选", key="btn1"):
+            log_action(current_user, "任务一", str(len(uploaded_files)) + "个文件")
+            today = datetime.now().date()
+            target_dates = [today, today + timedelta(days=1), today + timedelta(days=2)]
+            all_dfs = []
+            for file in uploaded_files:
+                df = smart_read(file)
+                if df is not None:
+                    df.columns = df.columns.str.strip()
+                    if '超时时间' in df.columns:
+                        df['超时时间_日期'] = pd.to_datetime(df['超时时间'], errors='coerce').dt.date
+                        filtered = df[df['超时时间_日期'].isin(target_dates)].copy()
+                        if not filtered.empty:
+                            needed = ['订单编号', '退货物流公司', '退货物流单号', '超时时间']
+                            actual = [c for c in needed if c in filtered.columns]
+                            for col in ['订单编号', '退货物流单号']:
+                                if col in filtered.columns:
+                                    filtered[col] = filtered[col].astype(str).str.replace(r'\.0$', '', regex=True)
+                            all_dfs.append(filtered[actual])
+            if all_dfs:
+                final_df = pd.concat(all_dfs, ignore_index=True)
+                st.success(f"筛选完成 {len(final_df)} 条")
+                st.dataframe(final_df)
+                st.download_button("📥 下载结果", to_excel_bytes(final_df), "即将超时.xlsx")
+            else:
+                st.warning("无匹配数据")
+
+    # --- 任务二 ---
+    elif task == "任务二：仓库表格清洗 (自动提交)":
+        st.header("🏭 任务二：仓库表格清洗")
+        uploaded_files = st.file_uploader("上传文件", type=['xls', 'xlsx', 'csv'], accept_multiple_files=True, key="t2")
+        if uploaded_files and st.button("开始清洗", type="primary", key="btn2"):
+            log_action(current_user, "任务二", str(len(uploaded_files)) + "个文件")
+            zip_buffer = io.BytesIO()
+            processed = 0
+            preview_list = []
+            with zipfile.ZipFile(zip_buffer, "w") as zf:
+                bar = st.progress(0)
+                for i, file in enumerate(uploaded_files):
+                    try:
+                        df = smart_read(file, dtype_str=True)
+                        if df is not None:
+                            if '退货物流单号' in df.columns: df = df.dropna(subset=['退货物流单号'])
+                            if '订单编号' in df.columns and '商家备注' in df.columns:
+                                df = df.groupby('订单编号', group_keys=False).apply(distribute_codes)
+
+                            target = pd.DataFrame()
+                            target['订单号'] = df.get('订单编号', '')
+                            target['快递'] = df.get('退货物流公司', '')
+                            target['运单号'] = df.get('退货物流单号', '')
+                            if '商家备注' in df.columns:
+                                target['商品'] = df['商家备注'].astype(str).str.replace('|', '',
+                                                                                        regex=False).str.strip()
+                            else:
+                                target['商品'] = ""
+                            target['退款数量'] = 1
+                            target['退货类型'] = '七天无理由退货'
+
+                            # 🔥 升级文件名：加入日期 20231225
+                            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                            server_filename = f"[{current_user}]_{file.name.split('.')[0]}_{timestamp}.xlsx"
+                            target.to_excel(os.path.join(DATA_DIR, server_filename), index=False)
+
+                            zf.writestr(f"清洗完_{file.name.rsplit('.', 1)[0]}.xlsx", to_excel_bytes(target))
+                            preview_list.append((file.name, target))
+                            processed += 1
+                    except:
+                        pass
+                    bar.progress((i + 1) / len(uploaded_files))
+
+            if processed > 0:
+                st.success("处理成功！已自动提交到仓库。")
+                for n, d in preview_list:
+                    with st.expander(f"📄 {n}", expanded=False): st.dataframe(d)
+                st.download_button("📦 下载清洗包", zip_buffer.getvalue(), "清洗结果.zip", "application/zip")
